@@ -800,6 +800,10 @@ async function calculate() {
   if (!sentence) { setStatus("Type a sentence first.", "error"); return; }
   const btn = $("calcBtn");
   btn.disabled = true;
+  // Remembers which stage failed, so the error message can blame
+  // the right thing: a download failure is a network problem, a
+  // failure while running a loaded model is not.
+  let modelLoaded = false;
   try {
     if (!model) setStatus("Downloading the model… (first time only, ~85 MB)");
     try {
@@ -812,12 +816,21 @@ async function calculate() {
       setStatus("The download hit a network problem (" + errText(firstErr) + ") — retrying once…");
       await loadModel();
     }
+    modelLoaded = true;
     setStatus("Running the model on your sentence…");
     // Token ids: 50256 is GPT-2's start-of-text marker, then the sentence tokens
     const ids = [50256].concat(tokenizer.encode(sentence));
-    const inputIds = new lib.Tensor("int64", BigInt64Array.from(ids.map(BigInt)), [1, ids.length]);
+    const n = ids.length;
+    /* DistilGPT-2's ONNX graph needs all three inputs, not just the
+       token ids: running it with input_ids alone fails with
+       "Missing the following inputs: attention_mask, position_ids".
+       The mask is all 1s (every position is a real token) and the
+       position ids are simply 0, 1, 2, … up the sequence. */
+    const inputIds = new lib.Tensor("int64", BigInt64Array.from(ids.map(BigInt)), [1, n]);
+    const attentionMask = new lib.Tensor("int64", new BigInt64Array(n).fill(1n), [1, n]);
+    const positionIds = new lib.Tensor("int64", BigInt64Array.from(ids.map((_, i) => BigInt(i))), [1, n]);
     // One forward pass gives logits for every position: shape [1, n, vocab]
-    const output = await model({ input_ids: inputIds });
+    const output = await model({ input_ids: inputIds, attention_mask: attentionMask, position_ids: positionIds });
     const logits = output.logits;
     const vocab = logits.dims[2];
     const data = logits.data;
@@ -839,7 +852,14 @@ async function calculate() {
     // underlying error so the failure can actually be diagnosed —
     // never a made-up number, never a bare "network error".
     $("sentence").value = sentence;
-    setStatus("Error — the model could not be loaded or run: " + errText(err) + " · Your sentence is still in the box. The library downloads from cdn.jsdelivr.net and the model weights from huggingface.co — if either host is blocked on this network, the download cannot start. Check the connection and press Calculate again.", "error");
+    if (modelLoaded) {
+      // The model downloaded fine — this failed while running it.
+      // Show the real error plainly; it is not a network problem.
+      setStatus("Error — the model loaded but could not run: " + errText(err) + " · Your sentence is still in the box — press Calculate again to retry.", "error");
+    } else {
+      // The download itself failed. Only now is the network hint right.
+      setStatus("Error — the model could not be downloaded: " + errText(err) + " · Your sentence is still in the box. The library downloads from cdn.jsdelivr.net and the model weights from huggingface.co — if either host is blocked on this network, the download cannot start. Check the connection and press Calculate again.", "error");
+    }
   } finally {
     btn.disabled = false;
   }
